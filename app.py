@@ -525,7 +525,7 @@ async function stopBot(){
   await fetch('/api/stop',{method:'POST'});
 }
 
-setInterval(fetchStatus, 3000);
+setInterval(fetchStatus, 1000);
 fetchStatus();
 </script>
 </body>
