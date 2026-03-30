@@ -160,13 +160,21 @@ async def run_bot():
             log.info(f"ENTRADA: {asset} {signal.upper()} ${bet} {tf_mode} {conf}%")
             await asyncio.sleep(tf_wait)
 
-            # Tenta pegar resultado com timeout
+            # Pega resultado com timeout de 10s para não travar
             profit = 0
             try:
-                result = api.check_win_v3(trade_id)
-                profit = float(result) if result else 0
-            except:
-                log.warning("check_win_v3 falhou — continuando")
+                import concurrent.futures
+                loop = asyncio.get_event_loop()
+                with concurrent.futures.ThreadPoolExecutor() as pool:
+                    future = loop.run_in_executor(pool, api.check_win_v3, trade_id)
+                    result = await asyncio.wait_for(future, timeout=10)
+                    profit = float(result) if result else 0
+            except asyncio.TimeoutError:
+                log.warning("check_win_v3 timeout — verificando saldo")
+                new_bal = api.get_balance()
+                profit = new_bal - state['balance']
+            except Exception as e:
+                log.warning(f"check_win erro: {e}")
                 profit = 0
             res="WIN" if profit>0 else "LOSS"
             if profit>0: state['wins']+=1
