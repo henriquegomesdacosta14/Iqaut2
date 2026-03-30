@@ -31,6 +31,41 @@ state = {
 
 def sma(cl,p): return [None if i<p-1 else sum(cl[i-p+1:i+1])/p for i in range(len(cl))]
 
+def ema(cl, p):
+    k = 2/(p+1)
+    result = [None]*(p-1)
+    result.append(sum(cl[:p])/p)
+    for i in range(p, len(cl)):
+        result.append(cl[i]*k + result[-1]*(1-k))
+    return result
+
+def bollinger(cl, p=20, std=2):
+    result = []
+    for i in range(len(cl)):
+        if i < p-1:
+            result.append(None)
+            continue
+        sl = cl[i-p+1:i+1]
+        mean = sum(sl)/p
+        variance = sum((x-mean)**2 for x in sl)/p
+        sd = variance**0.5
+        result.append({"mid":mean,"upper":mean+std*sd,"lower":mean-std*sd})
+    return result
+
+def macd(cl, fast=12, slow=26, signal=9):
+    e_fast = ema(cl, fast)
+    e_slow = ema(cl, slow)
+    macd_line = [None if e_fast[i] is None or e_slow[i] is None else e_fast[i]-e_slow[i] for i in range(len(cl))]
+    valid = [x for x in macd_line if x is not None]
+    sig_line = [None]*len(macd_line)
+    if len(valid) >= signal:
+        start = next(i for i,x in enumerate(macd_line) if x is not None)
+        sig_vals = ema(valid, signal)
+        for i,v in enumerate(sig_vals):
+            sig_line[start+i] = v
+    hist = [None if macd_line[i] is None or sig_line[i] is None else macd_line[i]-sig_line[i] for i in range(len(macd_line))]
+    return macd_line, sig_line, hist
+
 def rsi(cl,p=14):
     if len(cl)<p+1: return 50
     g=l=0
@@ -62,22 +97,60 @@ def get_patterns(c):
     return pats
 
 def analyze(candles, asset=""):
-    if len(candles)<10: return {"signal":"AGUARDE","confidence":0,"asset":asset}
+    if len(candles)<30: return {"signal":"AGUARDE","confidence":0,"asset":asset}
     cl=[c['close'] for c in candles]
-    m9=sma(cl,9); m21=sma(cl,21); rv=rsi(cl); pats=get_patterns(candles)
+    hi=[c['max'] for c in candles]
+    lo=[c['min'] for c in candles]
+
+    # Indicadores
+    m9=sma(cl,9); m21=sma(cl,21)
+    rv=rsi(cl)
+    bb=bollinger(cl,20)
+    ml,sl,mh=macd(cl)
+    pats=get_patterns(candles)
+
     lm9=m9[-1]; lm21=m21[-1]; pm9=m9[-5] if len(m9)>=5 else lm9
+    last_bb=bb[-1]; last_price=cl[-1]
+    last_ml=ml[-1]; last_sl=sl[-1]; last_mh=mh[-1]
+    prev_mh=mh[-2] if len(mh)>=2 else last_mh
+
     bs=ss=0
+
+    # MM9 vs MM21
     if lm9 and lm21:
-        if lm9>lm21 and lm9>pm9: bs+=30
-        elif lm9<lm21 and lm9<pm9: ss+=30
-    if rv<30: bs+=25
-    elif rv>70: ss+=25
+        if lm9>lm21 and lm9>pm9: bs+=20
+        elif lm9<lm21 and lm9<pm9: ss+=20
+
+    # RSI
+    if rv<25: bs+=25
+    elif rv>75: ss+=25
+    elif rv<35: bs+=10
+    elif rv>65: ss+=10
+
+    # Bollinger Bands
+    if last_bb:
+        if last_price <= last_bb['lower']: bs+=25  # preço tocou banda inferior = sobrevenda
+        elif last_price >= last_bb['upper']: ss+=25  # preço tocou banda superior = sobrecompra
+        elif last_price < last_bb['mid']: bs+=5
+        elif last_price > last_bb['mid']: ss+=5
+
+    # MACD
+    if last_ml and last_sl and last_mh and prev_mh:
+        if last_ml > last_sl and last_mh > 0 and prev_mh <= 0: bs+=25  # cruzamento bullish
+        elif last_ml < last_sl and last_mh < 0 and prev_mh >= 0: ss+=25  # cruzamento bearish
+        elif last_ml > last_sl: bs+=10
+        elif last_ml < last_sl: ss+=10
+
+    # Padrões de velas
     for p in pats:
-        if p=="bull": bs+=20
-        elif p=="bear": ss+=20
+        if p=="bull": bs+=15
+        elif p=="bear": ss+=15
+
     tot=bs+ss or 1
-    if bs>ss and bs>30: return {"signal":"call","confidence":min(95,round(bs/tot*100)),"asset":asset}
-    elif ss>bs and ss>30: return {"signal":"put","confidence":min(95,round(ss/tot*100)),"asset":asset}
+    if bs>ss and bs>35:
+        return {"signal":"call","confidence":min(95,round(bs/tot*100)),"asset":asset}
+    elif ss>bs and ss>35:
+        return {"signal":"put","confidence":min(95,round(ss/tot*100)),"asset":asset}
     return {"signal":"AGUARDE","confidence":0,"asset":asset}
 
 async def run_bot():
@@ -163,13 +236,19 @@ async def run_bot():
             bal_antes = api.get_balance()
             await asyncio.sleep(tf_wait)
 
-            # Calcula resultado pela diferença de saldo (sem usar check_win_v3)
+            # Calcula resultado pela diferença de saldo
             try:
                 bal_depois = api.get_balance()
-                profit = round(bal_depois - bal_antes, 2)
-                log.info(f"Saldo antes: ${bal_antes:.2f} | depois: ${bal_depois:.2f} | diff: ${profit:.2f}")
+                diff = round(bal_depois - bal_antes, 2)
+                # WIN: lucro positivo (descontando o valor apostado)
+                # LOSS: perde o valor apostado
+                if diff > 0:
+                    profit = diff  # ganhou
+                else:
+                    profit = -bet  # perdeu o valor apostado
+                log.info(f"Antes: ${bal_antes:.2f} | Depois: ${bal_depois:.2f} | Profit: ${profit:.2f}")
             except Exception as e:
-                log.warning(f"Erro ao pegar saldo: {e}")
+                log.warning(f"Erro saldo: {e}")
                 profit = 0
             res="WIN" if profit>0 else "LOSS"
             if profit>0: state['wins']+=1
@@ -293,8 +372,8 @@ body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-he
 .act-btn{font-size:12px;font-weight:700;padding:12px;border-radius:10px;cursor:pointer;border:1px solid;text-align:center;transition:all .2s;letter-spacing:.5px}
 .btn-demo{border-color:var(--yellow);color:var(--yellow);background:rgba(245,158,11,.08)}
 .btn-demo:hover{background:var(--yellow);color:#000}
-.btn-stop{border-color:var(--red);color:var(--red);background:rgba(239,68,68,.08)}
-.btn-stop:hover{background:var(--red);color:#fff}
+.btn-reset{border-color:var(--accent);color:var(--accent);background:rgba(59,130,246,.08)}
+.btn-reset:hover{background:var(--accent);color:#fff}
 
 /* SCAN RESULTS */
 .section-title{font-size:11px;font-weight:700;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;font-family:'DM Mono',monospace}
@@ -390,6 +469,9 @@ body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-he
   <div class="action-btns">
     <div class="act-btn btn-demo" onclick="toggleAcc()">🔄 DEMO / REAL</div>
     <div class="act-btn btn-stop" onclick="stopBot()">⏹ PARAR BOT</div>
+  </div>
+  <div class="action-btns" style="margin-top:-4px">
+    <div class="act-btn btn-reset" onclick="resetStats()" style="grid-column:span 2">🔁 RESETAR ESTATÍSTICAS</div>
   </div>
 
   <!-- SCAN RESULTS -->
@@ -524,6 +606,12 @@ async function setBet(val){
   await fetch('/api/set-bet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bet:newBet})});
 }
 
+async function resetStats(){
+  if(!confirm('Resetar todas as estatísticas?')) return;
+  await fetch('/api/reset',{method:'POST'});
+  fetchStatus();
+}
+
 async function toggleAcc(){
   await fetch('/api/toggle',{method:'POST'});
   fetchStatus();
@@ -563,8 +651,12 @@ def set_bet():
     state['bet_amount'] = max(1, bet)
     return jsonify({'ok':True})
 
-@app.route('/api/stop', methods=['POST'])
-def stop():
+@app.route('/api/reset', methods=['POST'])
+def reset():
+    state['trades']=0; state['wins']=0; state['losses']=0; state['profit']=0.0
+    state['last_signal']=None; state['active_trade']=None; state['trade_history']=[]
+    state['status_msg']="✅ Estatísticas resetadas!"
+    return jsonify({'ok':True})
     state['running'] = False
     return jsonify({'ok':True})
 
