@@ -160,8 +160,14 @@ async def run_bot():
             log.info(f"ENTRADA: {asset} {signal.upper()} ${bet} {tf_mode} {conf}%")
             await asyncio.sleep(tf_wait)
 
-            result=api.check_win_v3(trade_id)
-            profit=float(result) if result else 0
+            # Tenta pegar resultado com timeout
+            profit = 0
+            try:
+                result = api.check_win_v3(trade_id)
+                profit = float(result) if result else 0
+            except:
+                log.warning("check_win_v3 falhou — continuando")
+                profit = 0
             res="WIN" if profit>0 else "LOSS"
             if profit>0: state['wins']+=1
             else: state['losses']+=1
