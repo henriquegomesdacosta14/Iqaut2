@@ -136,7 +136,7 @@ async def run_bot():
             if not best or best['confidence']<MIN_CONFIDENCE:
                 m=best['confidence'] if best else 0
                 state['status_msg']=f"⏳ Aguardando sinal ≥{MIN_CONFIDENCE}%... (melhor: {m}%)"
-                await asyncio.sleep(tf_candle); continue
+                await asyncio.sleep(15); continue
 
             asset=best['asset']; signal=best['signal']; conf=best['confidence']
             state['status_msg']=f"🚀 {asset} {signal.upper()} {conf}% | {tf_mode} | ${bet}"
