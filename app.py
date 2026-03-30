@@ -1,28 +1,35 @@
 import asyncio, os, time, logging, threading
 from datetime import datetime
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from iqoptionapi.stable_api import IQ_Option
 
 IQ_EMAIL       = os.environ.get("IQ_EMAIL", "")
 IQ_PASSWORD    = os.environ.get("IQ_PASSWORD", "")
-TIMEFRAME      = int(os.environ.get("TIMEFRAME", "60"))
-BET_AMOUNT     = float(os.environ.get("BET_AMOUNT", "3"))
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "75"))
 MAX_LOSS_PCT   = float(os.environ.get("MAX_LOSS_PCT", "20"))
 MAX_TRADES     = int(os.environ.get("MAX_TRADES", "20"))
 
-OTC_ASSETS = ["EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","AUDUSD-OTC","USDCAD-OTC","USDCHF-OTC","NZDUSD-OTC","EURGBP-OTC","EURJPY-OTC","GBPJPY-OTC","AUDJPY-OTC","EURCHF-OTC"]
+# TF_MODE: "M1" ou "M5"
+TF_MODE = os.environ.get("TF_MODE", "M1")
+
+# IQ Option: buy() usa 1=M1, 5=M5 | get_candles() usa 60=M1, 300=M5
+TF_BUY    = {"M1": 1,  "M5": 5}
+TF_CANDLE = {"M1": 60, "M5": 300}
+
+OTC_ASSETS  = ["EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","AUDUSD-OTC","USDCAD-OTC","USDCHF-OTC","NZDUSD-OTC","EURGBP-OTC","EURJPY-OTC","GBPJPY-OTC","AUDJPY-OTC","EURCHF-OTC"]
 OPEN_ASSETS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURCHF"]
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(message)s', datefmt='%H:%M:%S')
 log = logging.getLogger("BOT")
 
 state = {
-    "trades":0,"wins":0,"losses":0,"profit":0.0,
+    "trades":0,"wins":0,"losses":0,"profit":0.0,"balance":0.0,
     "running":True,"scanning":False,
     "last_signal":None,"trade_history":[],
     "account_type":os.environ.get("ACCOUNT_TYPE","PRACTICE"),
-    "scan_results":[],"status_msg":"Iniciando..."
+    "scan_results":[],"status_msg":"Iniciando...",
+    "tf_mode": TF_MODE,
+    "bet_amount": float(os.environ.get("BET_AMOUNT","3")),
 }
 
 def sma(cl,p): return [None if i<p-1 else sum(cl[i-p+1:i+1])/p for i in range(len(cl))]
@@ -77,7 +84,7 @@ def analyze(candles, asset=""):
     return {"signal":"AGUARDE","confidence":0,"asset":asset}
 
 async def run_bot():
-    log.info("BOT iniciando — 24 pares")
+    log.info("BOT iniciando — 24 pares OTC + aberto")
     api=IQ_Option(IQ_EMAIL,IQ_PASSWORD)
     check,reason=api.connect()
     if not check:
@@ -86,24 +93,32 @@ async def run_bot():
     api.change_balance(state['account_type'])
     bal=api.get_balance()
     initial=bal
+    state['balance']=bal
     state['status_msg']=f"Conectado | Saldo: ${bal:.2f}"
 
     while state['running']:
         try:
             bal=api.get_balance()
+            state['balance']=bal
             if initial>0 and (initial-bal)/initial*100>=MAX_LOSS_PCT:
-                state['status_msg']="STOP LOSS atingido"; break
+                state['status_msg']="🛑 STOP LOSS atingido"; break
             if state['trades']>=MAX_TRADES:
-                state['status_msg']=f"Limite {MAX_TRADES} trades"; break
+                state['status_msg']=f"✋ Limite {MAX_TRADES} trades"; break
+
+            tf_mode = state['tf_mode']
+            tf_buy    = TF_BUY.get(tf_mode, 1)
+            tf_candle = TF_CANDLE.get(tf_mode, 60)
+            tf_wait   = tf_candle  # segundos para aguardar resultado
+            bet = state['bet_amount']
 
             state['scanning']=True
             all_assets=OTC_ASSETS+OPEN_ASSETS
-            state['status_msg']=f"Varrendo {len(all_assets)} ativos..."
+            state['status_msg']=f"🔍 Varrendo {len(all_assets)} ativos... ({tf_mode} | ${bet})"
             best=None; results=[]
 
             for asset in all_assets:
                 try:
-                    candles=api.get_candles(asset,TIMEFRAME,50,time.time())
+                    candles=api.get_candles(asset, tf_candle, 50, time.time())
                     if not candles or len(candles)<10: continue
                     r=analyze(candles,asset)
                     if r['signal']!='AGUARDE':
@@ -119,21 +134,28 @@ async def run_bot():
 
             if not best or best['confidence']<MIN_CONFIDENCE:
                 m=best['confidence'] if best else 0
-                state['status_msg']=f"Aguardando sinal forte... (melhor: {m}%)"
-                await asyncio.sleep(TIMEFRAME); continue
+                state['status_msg']=f"⏳ Aguardando sinal ≥{MIN_CONFIDENCE}%... (melhor: {m}%)"
+                await asyncio.sleep(tf_candle); continue
 
             asset=best['asset']; signal=best['signal']; conf=best['confidence']
-            state['status_msg']=f"Entrando: {asset} {signal.upper()} {conf}%"
-            log.info(f"ENTRADA: {asset} {signal.upper()} ${BET_AMOUNT} {conf}%")
+            state['status_msg']=f"🚀 {asset} {signal.upper()} {conf}% | {tf_mode} | ${bet}"
+            log.info(f"ENTRADA: {asset} {signal.upper()} ${bet} {tf_mode} {conf}%")
 
-            ok,trade_id=api.buy(BET_AMOUNT,asset,signal,TIMEFRAME)
+            # BUY com timeframe correto (1 para M1, 5 para M5)
+            ok,trade_id=api.buy(bet, asset, signal, tf_buy)
             if not ok:
+                log.error(f"Falha trade")
                 await asyncio.sleep(10); continue
 
             state['trades']+=1
-            state['last_signal']={"time":datetime.now().strftime("%H:%M:%S"),"asset":asset,"signal":signal.upper(),"confidence":conf,"result":"pending","profit":0}
-            state['status_msg']=f"Trade aberto: {asset} — aguardando resultado..."
-            await asyncio.sleep(TIMEFRAME+5)
+            state['last_signal']={
+                "time":datetime.now().strftime("%H:%M:%S"),
+                "asset":asset,"signal":signal.upper(),
+                "confidence":conf,"result":"pending","profit":0,
+                "tf_mode":tf_mode,"amount":bet
+            }
+            state['status_msg']=f"⏳ {asset} {signal.upper()} aberto — aguardando {tf_mode}..."
+            await asyncio.sleep(tf_wait+5)
 
             result=api.check_win_v3(trade_id)
             profit=float(result) if result else 0
@@ -143,9 +165,15 @@ async def run_bot():
             state['profit']+=profit
             state['last_signal']['result']=res
             state['last_signal']['profit']=profit
-            state['trade_history'].insert(0,{"time":datetime.now().strftime("%H:%M:%S"),"asset":asset,"signal":signal.upper(),"confidence":conf,"result":res,"profit":profit})
+            state['trade_history'].insert(0,{
+                "time":datetime.now().strftime("%H:%M:%S"),
+                "asset":asset,"signal":signal.upper(),
+                "confidence":conf,"result":res,"profit":profit,
+                "tf_mode":tf_mode,"amount":bet
+            })
             if len(state['trade_history'])>50: state['trade_history'].pop()
-            log.info(f"{'WIN' if profit>0 else 'LOSS'} ${profit:.2f}")
+            state['balance']=api.get_balance()
+            log.info(f"{'WIN' if profit>0 else 'LOSS'} ${profit:.2f} | Saldo: ${state['balance']:.2f}")
             await asyncio.sleep(5)
         except KeyboardInterrupt: break
         except Exception as e:
@@ -167,14 +195,14 @@ h1{font-family:'Orbitron',monospace;font-size:18px;color:var(--accent);text-shad
 .sub{text-align:center;font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--dim);margin-bottom:10px;letter-spacing:2px}
 .status{text-align:center;font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--accent);margin-bottom:10px;padding:6px;background:var(--panel);border-radius:3px;border:1px solid var(--border)}
 .badge{display:inline-block;font-family:'Share Tech Mono',monospace;font-size:9px;padding:3px 10px;border-radius:2px;border:1px solid;margin:0 4px 10px}
-.bd{border-color:var(--yellow);color:var(--yellow)}.br{border-color:var(--red);color:var(--red)}.bs{border-color:var(--accent);color:var(--accent);animation:pulse 1s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.bd{border-color:var(--yellow);color:var(--yellow)}.br{border-color:var(--red);color:var(--red)}.bs{border-color:var(--accent);color:var(--accent);animation:blink 1s infinite}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
 .sb{border-radius:4px;padding:16px;text-align:center;border:2px solid var(--border);background:var(--panel);margin-bottom:12px;transition:all .4s}
 .sb.call{border-color:var(--green);background:#00ff8808;box-shadow:0 0 30px #00ff8820}
 .sb.put{border-color:var(--red);background:#ff335508;box-shadow:0 0 30px #ff335520}
 .sb.wait{border-color:var(--yellow)}
 .sa{font-family:'Share Tech Mono',monospace;font-size:10px;color:var(--dim);letter-spacing:2px}
-.st{font-family:'Orbitron',monospace;font-size:28px;font-weight:900;letter-spacing:5px;margin:6px 0}
+.st{font-family:'Orbitron',monospace;font-size:26px;font-weight:900;letter-spacing:5px;margin:6px 0}
 .call .st{color:var(--green);text-shadow:0 0 20px var(--green)}
 .put .st{color:var(--red);text-shadow:0 0 20px var(--red)}
 .wait .st{color:var(--yellow);font-size:14px}
@@ -182,21 +210,32 @@ h1{font-family:'Orbitron',monospace;font-size:18px;color:var(--accent);text-shad
 .cb{height:4px;background:#03070d;border-radius:3px;overflow:hidden;margin-top:8px}
 .cf{height:100%;border-radius:3px;transition:width .8s ease}
 .call .cf{background:var(--green)}.put .cf{background:var(--red)}.wait .cf{background:var(--yellow)}
-.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-bottom:12px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:12px;text-align:center}
-.cl{font-family:'Share Tech Mono',monospace;font-size:8px;color:var(--dim);letter-spacing:2px;margin-bottom:4px}
-.cv{font-family:'Orbitron',monospace;font-size:20px;font-weight:900}
+.grid3{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:8px}
+.grid2{display:grid;grid-template-columns:repeat(2,1fr);gap:6px;margin-bottom:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:10px;text-align:center}
+.cl{font-family:'Share Tech Mono',monospace;font-size:8px;color:var(--dim);letter-spacing:1px;margin-bottom:4px}
+.cv{font-family:'Orbitron',monospace;font-size:17px;font-weight:900}
 .cg{color:var(--green)}.cr{color:var(--red)}.cy{color:var(--yellow)}.cb2{color:var(--accent)}
+.settings{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:10px;margin-bottom:10px}
+.set-row{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+.set-row:last-child{margin-bottom:0}
+.set-label{font-family:'Share Tech Mono',monospace;font-size:9px;color:var(--dim)}
+.set-btns{display:flex;gap:4px}
+.sbtn{font-family:'Share Tech Mono',monospace;font-size:10px;padding:4px 14px;border-radius:2px;cursor:pointer;border:1px solid var(--border);color:var(--dim);background:var(--bg);transition:all .2s}
+.sbtn.on{border-color:var(--accent);color:var(--accent);background:#00c8ff15}
+.set-ctrl{display:flex;align-items:center;gap:8px}
+.sinc{font-size:16px;padding:2px 12px;border-radius:2px;cursor:pointer;border:1px solid var(--border);color:var(--text);background:var(--bg);line-height:1.4}
+.sval{font-family:'Orbitron',monospace;font-size:13px;color:var(--accent);min-width:36px;text-align:center}
 .controls{display:flex;gap:8px;margin-bottom:12px}
-.btn{font-family:'Orbitron',monospace;font-size:8px;letter-spacing:1px;padding:9px 12px;border-radius:3px;cursor:pointer;border:1px solid;flex:1;text-align:center;text-decoration:none;display:block}
+.btn{font-family:'Orbitron',monospace;font-size:8px;letter-spacing:1px;padding:9px;border-radius:3px;cursor:pointer;border:1px solid;flex:1;text-align:center}
 .bstop{border-color:var(--red);color:var(--red);background:#ff335510}
 .bacc{border-color:var(--yellow);color:var(--yellow);background:#ffc20010}
 .tt{font-family:'Orbitron',monospace;font-size:8px;letter-spacing:2px;color:var(--dim);margin-bottom:8px}
-.sg{display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto;margin-bottom:12px}
+.sg{display:flex;flex-direction:column;gap:4px;max-height:160px;overflow-y:auto;margin-bottom:12px}
 .si{display:flex;justify-content:space-between;padding:5px 8px;background:var(--panel);border-radius:2px;border-left:3px solid var(--border);font-family:'Share Tech Mono',monospace;font-size:10px}
 .si.c{border-left-color:var(--green)}.si.p{border-left-color:var(--red)}
-.lb{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:10px;font-family:'Share Tech Mono',monospace;font-size:9px;max-height:160px;overflow-y:auto}
-.le{padding:3px 0;border-bottom:1px solid #0d2235;line-height:1.5}
+.lb{background:var(--panel);border:1px solid var(--border);border-radius:4px;padding:10px;font-family:'Share Tech Mono',monospace;font-size:9px;max-height:200px;overflow-y:auto}
+.le{padding:4px 0;border-bottom:1px solid #0d2235;line-height:1.7}
 .lw{color:var(--green)}.ll{color:var(--red)}.ld{color:var(--dim)}
 </style>
 </head>
@@ -208,27 +247,56 @@ h1{font-family:'Orbitron',monospace;font-size:18px;color:var(--accent);text-shad
   <span id="sb2" class="badge bs" style="display:none">🔍 VARRENDO</span>
 </div>
 <div class="status" id="sm">Conectando...</div>
+
 <div id="sigBox" class="sb wait">
   <div class="sa" id="sa">AGUARDANDO SINAL</div>
   <div class="st" id="st">AGUARDE</div>
   <div class="sc" id="sc">Iniciando...</div>
   <div class="cb"><div class="cf" id="cf" style="width:0%"></div></div>
 </div>
-<div class="grid">
-  <div class="card"><div class="cl">TRADES</div><div class="cv cb2" id="tt">0</div></div>
-  <div class="card"><div class="cl">WINS</div><div class="cv cg" id="ww">0</div></div>
-  <div class="card"><div class="cl">LOSSES</div><div class="cv cr" id="ll">0</div></div>
+
+<div class="grid3">
+  <div class="card"><div class="cl">SALDO</div><div class="cv cg" id="bal">$0.00</div></div>
   <div class="card"><div class="cl">LUCRO</div><div class="cv cy" id="pp">+$0.00</div></div>
+  <div class="card"><div class="cl">TRADES</div><div class="cv cb2" id="tt">0</div></div>
 </div>
+<div class="grid2">
+  <div class="card"><div class="cl">✅ WINS</div><div class="cv cg" id="ww">0</div></div>
+  <div class="card"><div class="cl">❌ LOSSES</div><div class="cv cr" id="ll">0</div></div>
+</div>
+
+<div class="settings">
+  <div class="set-row">
+    <span class="set-label">⏱ TIMEFRAME</span>
+    <div class="set-btns">
+      <div class="sbtn" id="btnM1" onclick="setTF('M1')">M1</div>
+      <div class="sbtn" id="btnM5" onclick="setTF('M5')">M5</div>
+    </div>
+  </div>
+  <div class="set-row">
+    <span class="set-label">💵 ENTRADA</span>
+    <div class="set-ctrl">
+      <div class="sinc" onclick="changeBet(-1)">−</div>
+      <span class="sval" id="betVal">$3</span>
+      <div class="sinc" onclick="changeBet(1)">+</div>
+    </div>
+  </div>
+</div>
+
 <div class="controls">
   <div class="btn bacc" onclick="toggleAcc()">🔄 DEMO / REAL</div>
   <div class="btn bstop" onclick="stopBot()">⏹ PARAR</div>
 </div>
+
 <div class="tt">🔍 MELHORES SINAIS</div>
 <div class="sg" id="sg"><div class="ld" style="padding:8px;font-size:10px">Aguardando scan...</div></div>
-<div class="tt">📋 HISTÓRICO</div>
+
+<div class="tt">📋 HISTÓRICO DE TRADES</div>
 <div class="lb" id="lb"><div class="le ld">Sem trades ainda</div></div>
+
 <script>
+let currentBet = 3;
+
 async function fetchStatus(){
   try{
     const d=await(await fetch('/api/status')).json();
@@ -245,12 +313,14 @@ async function fetchStatus(){
     if(sig && sig.result!=='pending'){
       const s=sig.signal;
       document.getElementById('sigBox').className='sb '+(s==='CALL'?'call':s==='PUT'?'put':'wait');
-      document.getElementById('sa').textContent=sig.asset||'---';
+      document.getElementById('sa').textContent=`${sig.asset||'---'} · ${sig.tf_mode||''} · $${sig.amount||''}`;
       document.getElementById('st').textContent=s==='CALL'?'▲ CALL':s==='PUT'?'▼ PUT':'AGUARDE';
-      document.getElementById('sc').textContent=sig.confidence+'% · '+sig.result+' · '+sig.time;
-      document.getElementById('cf').style.width=sig.confidence+'%';
+      document.getElementById('sc').textContent=`${sig.confidence||0}% · ${sig.result||''} · ${sig.time||''}`;
+      document.getElementById('cf').style.width=(sig.confidence||0)+'%';
     }
     // stats
+    const bal=d.balance||0;
+    document.getElementById('bal').textContent=`$${bal.toFixed(2)}`;
     document.getElementById('tt').textContent=d.trades||0;
     document.getElementById('ww').textContent=d.wins||0;
     document.getElementById('ll').textContent=d.losses||0;
@@ -258,11 +328,18 @@ async function fetchStatus(){
     const pe=document.getElementById('pp');
     pe.textContent=(pv>=0?'+':'')+`$${pv.toFixed(2)}`;
     pe.style.color=pv>0?'var(--green)':pv<0?'var(--red)':'var(--yellow)';
+    // TF buttons
+    const tf=d.tf_mode||'M1';
+    document.getElementById('btnM1').className='sbtn'+(tf==='M1'?' on':'');
+    document.getElementById('btnM5').className='sbtn'+(tf==='M5'?' on':'');
+    // bet
+    currentBet=d.bet_amount||3;
+    document.getElementById('betVal').textContent=`$${currentBet}`;
     // scan results
     if(d.scan_results&&d.scan_results.length>0){
       document.getElementById('sg').innerHTML=d.scan_results.map(r=>
         `<div class="si ${r.signal==='call'?'c':'p'}">
-          <span>${r.asset}</span>
+          <span style="color:var(--text)">${r.asset}</span>
           <span style="color:${r.signal==='call'?'var(--green)':'var(--red)'}">${r.signal==='call'?'▲ CALL':'▼ PUT'}</span>
           <span class="ld">${r.confidence}%</span>
         </div>`).join('');
@@ -271,19 +348,37 @@ async function fetchStatus(){
     if(d.trade_history&&d.trade_history.length>0){
       document.getElementById('lb').innerHTML=d.trade_history.map(t=>{
         const p=t.profit;
-        return `<div class="le ${t.result==='WIN'?'lw':'ll'}">[${t.time}] ${t.asset} ${t.signal} ${t.confidence}% → ${t.result} ${p>=0?'+':''}$${p.toFixed(2)}</div>`;
+        const emoji=t.result==='WIN'?'✅':'❌';
+        return `<div class="le ${t.result==='WIN'?'lw':'ll'}">
+          ${emoji} [${t.time}] <strong>${t.asset}</strong> ${t.signal} · ${t.tf_mode} · $${t.amount}
+          <br><span class="ld">Confiança: ${t.confidence}% → ${t.result} ${p>=0?'+':''}$${p.toFixed(2)}</span>
+        </div>`;
       }).join('');
     }
   }catch(e){console.error(e);}
 }
+
+async function setTF(tf){
+  await fetch('/api/set-tf',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({tf})});
+  fetchStatus();
+}
+
+async function changeBet(delta){
+  const newBet=Math.max(1,currentBet+delta);
+  await fetch('/api/set-bet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bet:newBet})});
+  fetchStatus();
+}
+
 async function toggleAcc(){
   await fetch('/api/toggle',{method:'POST'});
   fetchStatus();
 }
+
 async function stopBot(){
   if(!confirm('Parar o bot?'))return;
   await fetch('/api/stop',{method:'POST'});
 }
+
 setInterval(fetchStatus,3000);
 fetchStatus();
 </script>
@@ -300,6 +395,21 @@ def status(): return jsonify(state)
 def toggle():
     state['account_type']='REAL' if state['account_type']=='PRACTICE' else 'PRACTICE'
     return jsonify({'ok':True})
+
+@app.route('/api/set-tf', methods=['POST'])
+def set_tf():
+    data=request.get_json()
+    tf=data.get('tf','M1')
+    if tf in ['M1','M5']:
+        state['tf_mode']=tf
+    return jsonify({'ok':True,'tf_mode':state['tf_mode']})
+
+@app.route('/api/set-bet', methods=['POST'])
+def set_bet():
+    data=request.get_json()
+    bet=float(data.get('bet',3))
+    state['bet_amount']=max(1,bet)
+    return jsonify({'ok':True,'bet_amount':state['bet_amount']})
 
 @app.route('/api/stop', methods=['POST'])
 def stop():
