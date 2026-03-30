@@ -13,8 +13,9 @@ MAX_TRADES     = int(os.environ.get("MAX_TRADES", "20"))
 TF_MODE = os.environ.get("TF_MODE", "M1")
 
 # IQ Option: buy() usa 1=M1, 5=M5 | get_candles() usa 60=M1, 300=M5
-TF_BUY    = {"M1": 1,  "M5": 5}
-TF_CANDLE = {"M1": 60, "M5": 300}
+# "turbo" = opções binárias de 1 minuto na IQ Option
+TF_BUY    = {"M1": "turbo", "M5": 5}
+TF_CANDLE = {"M1": 60,      "M5": 300}
 
 OTC_ASSETS  = ["EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","AUDUSD-OTC","USDCAD-OTC","USDCHF-OTC","NZDUSD-OTC","EURGBP-OTC","EURJPY-OTC","GBPJPY-OTC","AUDJPY-OTC","EURCHF-OTC"]
 OPEN_ASSETS = ["EURUSD","GBPUSD","USDJPY","AUDUSD","USDCAD","USDCHF","NZDUSD","EURGBP","EURJPY","GBPJPY","AUDJPY","EURCHF"]
@@ -106,9 +107,9 @@ async def run_bot():
                 state['status_msg']=f"✋ Limite {MAX_TRADES} trades"; break
 
             tf_mode = state['tf_mode']
-            tf_buy    = TF_BUY.get(tf_mode, 1)
+            tf_buy    = TF_BUY.get(tf_mode, "turbo")
             tf_candle = TF_CANDLE.get(tf_mode, 60)
-            tf_wait   = tf_candle  # segundos para aguardar resultado
+            tf_wait   = 65 if tf_mode == "M1" else 305
             bet = state['bet_amount']
 
             state['scanning']=True
