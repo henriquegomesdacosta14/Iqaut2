@@ -135,7 +135,9 @@ async def run_bot():
             asset=best['asset']; signal=best['signal']; conf=best['confidence']
             state['status_msg']=f"Entrando: {asset} {signal.upper()} {conf}%"
 
-            ok,trade_id=api.buy(bet,asset,signal,tf_buy)
+            # IQ Option buy_digital_spot para binárias com tempo correto
+            duration = 1 if tf_mode == "M1" else 5  # minutos
+            ok, trade_id = api.buy(bet, asset, signal, duration)
             if not ok:
                 log.error("Falha trade")
                 await asyncio.sleep(10); continue
