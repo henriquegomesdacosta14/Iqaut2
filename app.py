@@ -256,17 +256,18 @@ async def run_bot():
             bal_antes = api.get_balance()
             await asyncio.sleep(tf_wait)
 
+            # Aguarda mais 5s para garantir que o saldo atualizou
+            await asyncio.sleep(5)
+
             # Calcula resultado pela diferença de saldo
             try:
                 bal_depois = api.get_balance()
                 diff = round(bal_depois - bal_antes, 2)
-                # WIN: lucro positivo (descontando o valor apostado)
-                # LOSS: perde o valor apostado
                 if diff > 0:
-                    profit = diff  # ganhou
+                    profit = diff  # WIN
                 else:
-                    profit = -bet  # perdeu o valor apostado
-                log.info(f"Antes: ${bal_antes:.2f} | Depois: ${bal_depois:.2f} | Profit: ${profit:.2f}")
+                    profit = -bet  # LOSS
+                log.info(f"Antes: ${bal_antes:.2f} | Depois: ${bal_depois:.2f} | Diff: ${diff:.2f} | Profit: ${profit:.2f}")
             except Exception as e:
                 log.warning(f"Erro saldo: {e}")
                 profit = 0
