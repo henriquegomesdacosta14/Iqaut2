@@ -27,6 +27,9 @@ state = {
     "scan_results":[],"status_msg":"Iniciando...",
     "tf_mode":os.environ.get("TF_MODE","M1"),
     "bet_amount":float(os.environ.get("BET_AMOUNT","3")),
+    "invert":False,
+    "stop_loss":float(os.environ.get("STOP_LOSS","30")),
+    "win_target":float(os.environ.get("WIN_TARGET","20")),
 }
 
 def sma(cl,p): return [None if i<p-1 else sum(cl[i-p+1:i+1])/p for i in range(len(cl))]
@@ -170,8 +173,17 @@ async def run_bot():
         try:
             bal=api.get_balance()
             state['balance']=bal
-            if initial>0 and (initial-bal)/initial*100>=MAX_LOSS_PCT:
-                state['status_msg']="🛑 STOP LOSS"; break
+
+            # STOP LOSS em valor $
+            if state['profit'] <= -abs(state['stop_loss']):
+                state['status_msg']=f"🛑 STOP LOSS atingido: -${abs(state['stop_loss']):.2f}"
+                state['running']=False; break
+
+            # WIN TARGET em valor $
+            if state['profit'] >= abs(state['win_target']):
+                state['status_msg']=f"🎯 META ATINGIDA: +${abs(state['win_target']):.2f}"
+                state['running']=False; break
+
             if state['trades']>=MAX_TRADES:
                 state['status_msg']=f"✋ Limite atingido"; break
 
@@ -182,7 +194,8 @@ async def run_bot():
             bet=state['bet_amount']
 
             state['scanning']=True
-            state['status_msg']=f"Varrendo 24 ativos... ({tf_mode} | ${bet})"
+            inv = "🔄" if state['invert'] else ""
+            state['status_msg']=f"Varrendo 24 ativos... ({tf_mode} | ${bet}) {inv}"
             best=None; results=[]
 
             for asset in OTC_ASSETS+OPEN_ASSETS:
@@ -205,11 +218,18 @@ async def run_bot():
                 state['status_msg']=f"Aguardando sinal ≥{MIN_CONFIDENCE}%... (melhor: {m}%)"
                 await asyncio.sleep(15); continue
 
-            asset=best['asset']; signal=best['signal']; conf=best['confidence']
+            asset=best['asset']; conf=best['confidence']
+
+            # INVERTER SINAL se ativado
+            raw_signal=best['signal']
+            if state['invert']:
+                signal = "put" if raw_signal=="call" else "call"
+            else:
+                signal = raw_signal
+
             state['status_msg']=f"Entrando: {asset} {signal.upper()} {conf}%"
 
-            # IQ Option buy_digital_spot para binárias com tempo correto
-            duration = 1 if tf_mode == "M1" else 5  # minutos
+            duration = 1 if tf_mode == "M1" else 5
             ok, trade_id = api.buy(bet, asset, signal, duration)
             if not ok:
                 log.error("Falha trade")
@@ -372,8 +392,13 @@ body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-he
 .act-btn{font-size:12px;font-weight:700;padding:12px;border-radius:10px;cursor:pointer;border:1px solid;text-align:center;transition:all .2s;letter-spacing:.5px}
 .btn-demo{border-color:var(--yellow);color:var(--yellow);background:rgba(245,158,11,.08)}
 .btn-demo:hover{background:var(--yellow);color:#000}
-.btn-reset{border-color:var(--accent);color:var(--accent);background:rgba(59,130,246,.08)}
-.btn-reset:hover{background:var(--accent);color:#fff}
+.toggle-wrap{display:flex;align-items:center;gap:8px;cursor:pointer}
+.toggle-track{width:40px;height:22px;border-radius:11px;background:var(--border);position:relative;transition:background .3s}
+.toggle-track.on{background:var(--green)}
+.toggle-thumb{width:18px;height:18px;border-radius:50%;background:#fff;position:absolute;top:2px;left:2px;transition:left .3s}
+.toggle-track.on .toggle-thumb{left:20px}
+.toggle-label{font-family:'DM Mono',monospace;font-size:11px;color:var(--text3)}
+.toggle-track.on + .toggle-label{color:var(--green)}
 
 /* SCAN RESULTS */
 .section-title{font-size:11px;font-weight:700;color:var(--text3);letter-spacing:2px;text-transform:uppercase;margin-bottom:8px;font-family:'DM Mono',monospace}
@@ -463,6 +488,31 @@ body{background:var(--bg);color:var(--text);font-family:'Syne',sans-serif;min-he
         <div class="bet-btn" onclick="changeBet(1)">+</div>
       </div>
     </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">🔄 Inverter Sinais</span>
+      <div class="toggle-wrap" onclick="toggleInvert()">
+        <div class="toggle-track" id="invertTrack">
+          <div class="toggle-thumb" id="invertThumb"></div>
+        </div>
+        <span class="toggle-label" id="invertLabel">OFF</span>
+      </div>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">🛑 Stop Loss $</span>
+      <div class="bet-ctrl">
+        <div class="bet-btn" onclick="changeSL(-5)">−</div>
+        <input class="bet-input" id="slInput" type="number" min="1" step="1" value="30" onchange="setSL(this.value)">
+        <div class="bet-btn" onclick="changeSL(5)">+</div>
+      </div>
+    </div>
+    <div class="ctrl-row">
+      <span class="ctrl-label">🎯 Meta Ganho $</span>
+      <div class="bet-ctrl">
+        <div class="bet-btn" onclick="changeWT(-5)">−</div>
+        <input class="bet-input" id="wtInput" type="number" min="1" step="1" value="20" onchange="setWT(this.value)">
+        <div class="bet-btn" onclick="changeWT(5)">+</div>
+      </div>
+    </div>
   </div>
 
   <!-- ACTION BUTTONS -->
@@ -550,6 +600,18 @@ async function fetchStatus(){
     pe.textContent = (pv >= 0 ? '+' : '') + '$' + pv.toFixed(2);
     pe.style.color = pv > 0 ? 'var(--green)' : pv < 0 ? 'var(--red)' : 'var(--yellow)';
 
+    // invert toggle
+    const inv = d.invert || false;
+    const t=document.getElementById('invertTrack');
+    const l=document.getElementById('invertLabel');
+    if(t){ t.className='toggle-track'+(inv?' on':''); l.textContent=inv?'ON':'OFF'; }
+
+    // SL and WT
+    if(document.activeElement!==document.getElementById('slInput'))
+      document.getElementById('slInput').value=d.stop_loss||30;
+    if(document.activeElement!==document.getElementById('wtInput'))
+      document.getElementById('wtInput').value=d.win_target||20;
+
     // TF buttons
     const tf = d.tf_mode || 'M1';
     document.getElementById('btnM1').className = 'tf-btn' + (tf==='M1'?' active':'');
@@ -606,6 +668,34 @@ async function setBet(val){
   await fetch('/api/set-bet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({bet:newBet})});
 }
 
+async function toggleInvert(){
+  const d=await(await fetch('/api/toggle-invert',{method:'POST'})).json();
+  const t=document.getElementById('invertTrack');
+  const l=document.getElementById('invertLabel');
+  t.className='toggle-track'+(d.invert?' on':'');
+  l.textContent=d.invert?'ON':'OFF';
+}
+
+async function changeSL(delta){
+  const cur=parseFloat(document.getElementById('slInput').value)||30;
+  const v=Math.max(1,cur+delta);
+  document.getElementById('slInput').value=v;
+  await fetch('/api/set-sl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sl:v})});
+}
+async function setSL(v){
+  await fetch('/api/set-sl',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sl:Math.max(1,parseFloat(v)||1)})});
+}
+
+async function changeWT(delta){
+  const cur=parseFloat(document.getElementById('wtInput').value)||20;
+  const v=Math.max(1,cur+delta);
+  document.getElementById('wtInput').value=v;
+  await fetch('/api/set-wt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wt:v})});
+}
+async function setWT(v){
+  await fetch('/api/set-wt',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({wt:Math.max(1,parseFloat(v)||1)})});
+}
+
 async function resetStats(){
   if(!confirm('Resetar todas as estatísticas?')) return;
   await fetch('/api/reset',{method:'POST'});
@@ -650,6 +740,21 @@ def set_bet():
     bet = float(request.get_json().get('bet',3))
     state['bet_amount'] = max(1, bet)
     return jsonify({'ok':True})
+
+@app.route('/api/toggle-invert', methods=['POST'])
+def toggle_invert():
+    state['invert'] = not state['invert']
+    return jsonify({'invert': state['invert']})
+
+@app.route('/api/set-sl', methods=['POST'])
+def set_sl():
+    state['stop_loss'] = max(1, float(request.get_json().get('sl', 30)))
+    return jsonify({'ok': True})
+
+@app.route('/api/set-wt', methods=['POST'])
+def set_wt():
+    state['win_target'] = max(1, float(request.get_json().get('wt', 20)))
+    return jsonify({'ok': True})
 
 @app.route('/api/reset', methods=['POST'])
 def reset():
