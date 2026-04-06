@@ -1,12 +1,12 @@
-import asyncio, os, time, logging, threading
+import asyncio, os, time, logging, threading, json, urllib.request
 from datetime import datetime
 from flask import Flask, jsonify, request
 from iqoptionapi.stable_api import IQ_Option
 
 IQ_EMAIL       = os.environ.get("IQ_EMAIL", "")
 IQ_PASSWORD    = os.environ.get("IQ_PASSWORD", "")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "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")
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "75"))
-MAX_LOSS_PCT   = float(os.environ.get("MAX_LOSS_PCT", "20"))
 MAX_TRADES     = int(os.environ.get("MAX_TRADES", "20"))
 
 TF_BUY    = {"M1": 1,  "M5": 5}
@@ -156,6 +156,65 @@ def analyze(candles, asset=""):
         return {"signal":"put","confidence":min(95,round(ss/tot*100)),"asset":asset}
     return {"signal":"AGUARDE","confidence":0,"asset":asset}
 
+async def analyze_with_groq(candles, asset, local_signal):
+    """Confirma sinal com Groq AI"""
+    try:
+        cl = [c['close'] for c in candles[-20:]]
+        recent = candles[-10:]
+        candle_str = "\n".join([
+            f"{'🟢' if c['close']>c['open'] else '🔴'} O:{c['open']:.5f} H:{c['max']:.5f} L:{c['min']:.5f} C:{c['close']:.5f}"
+            for c in recent
+        ])
+        rv = rsi(cl)
+        m9 = sma(cl, 9)[-1]
+        m21 = sma(cl, 21)[-1] if len(cl) >= 21 else None
+
+        prompt = f"""Analise este ativo de opções binárias: {asset}
+
+Últimas 10 velas:
+{candle_str}
+
+RSI(14): {rv:.1f}
+MM9: {m9:.5f if m9 else 'N/A'}
+MM21: {m21:.5f if m21 else 'N/A'}
+Sinal técnico local: {local_signal.upper()}
+
+Responda APENAS com JSON:
+{{"signal":"call ou put ou aguarde","confidence":0-95,"reason":"1 frase"}}"""
+
+        payload = json.dumps({
+            "model": "llama3-8b-8192",
+            "max_tokens": 100,
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}]
+        }).encode()
+
+        req = urllib.request.Request(
+            "https://api.groq.com/openai/v1/chat/completions",
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {GROQ_API_KEY}"
+            }
+        )
+
+        loop = asyncio.get_event_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            response = await asyncio.wait_for(
+                loop.run_in_executor(pool, lambda: urllib.request.urlopen(req, timeout=8).read()),
+                timeout=10
+            )
+
+        data = json.loads(response)
+        text = data['choices'][0]['message']['content'].strip()
+        text = text.replace('```json','').replace('```','').strip()
+        result = json.loads(text)
+        return result
+    except Exception as e:
+        log.warning(f"Groq erro: {e}")
+        return None
+
 async def run_bot():
     log.info("BOT iniciando")
     api=IQ_Option(IQ_EMAIL,IQ_PASSWORD)
@@ -219,9 +278,26 @@ async def run_bot():
                 await asyncio.sleep(15); continue
 
             asset=best['asset']; conf=best['confidence']
+            raw_signal=best['signal']
+
+            # CONFIRMA COM GROQ AI
+            if GROQ_API_KEY:
+                log.info(f"🤖 Consultando Groq AI para {asset}...")
+                state['status_msg']=f"🤖 Groq analisando {asset}..."
+                candles=api.get_candles(asset,tf_candle,50,time.time())
+                ai=await analyze_with_groq(candles, asset, raw_signal)
+                if ai:
+                    ai_sig=ai.get('signal','aguarde').lower()
+                    ai_conf=ai.get('confidence',0)
+                    log.info(f"🤖 Groq: {ai_sig.upper()} {ai_conf}% — {ai.get('reason','')}")
+                    if ai_sig=='aguarde' or ai_conf<60:
+                        state['status_msg']=f"🤖 Groq disse AGUARDAR — pulando"
+                        await asyncio.sleep(10); continue
+                    # Usa sinal do Groq se divergir
+                    raw_signal=ai_sig
+                    conf=max(conf,ai_conf)
 
             # INVERTER SINAL se ativado
-            raw_signal=best['signal']
             if state['invert']:
                 signal = "put" if raw_signal=="call" else "call"
             else:
